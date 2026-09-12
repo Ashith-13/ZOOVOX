@@ -64,6 +64,15 @@ def _make_token_response(user: dict) -> dict:
 async def register(payload: UserRegisterRequest):
     db = await get_database()
 
+    # Fail closed: never fabricate a user or issue a token when the database
+    # is unreachable. Credentials cannot be verified without it.
+    if db is None:
+        logger.error("Registration rejected: database unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Registration is temporarily unavailable. Please try again shortly.",
+        )
+
     if await db.users.find_one({"email": payload.email}):
         raise HTTPException(status_code=409, detail="Email already registered")
 
@@ -92,6 +101,16 @@ async def register(payload: UserRegisterRequest):
 @router.post("/login", response_model=TokenResponse)
 async def login(payload: UserLoginRequest):
     db = await get_database()
+
+    # Fail closed: never fabricate a user or issue a token when the database
+    # is unreachable. Credentials cannot be verified without it.
+    if db is None:
+        logger.error("Login rejected: database unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Login is temporarily unavailable. Please try again shortly.",
+        )
+
     user = await db.users.find_one({"email": payload.email.lower()})
 
     if not user or not verify_password(payload.password, user["password_hash"]):

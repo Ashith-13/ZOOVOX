@@ -24,13 +24,29 @@ _db: AsyncIOMotorDatabase | None = None
 async def connect_to_mongo():
     global _client, _db
 
+    # Certificate validation must stay ON everywhere unless BOTH: the
+    # environment is explicitly "development" AND the operator has
+    # explicitly opted in via MONGODB_ALLOW_INSECURE_TLS. Neither condition
+    # alone is enough — this keeps the bypass off by default even if
+    # ENVIRONMENT is left unset (its own default is "development").
+    allow_invalid_certs = (
+        settings.ENVIRONMENT == "development"
+        and settings.MONGODB_ALLOW_INSECURE_TLS
+    )
+    if allow_invalid_certs:
+        logger.warning(
+            "MongoDB TLS certificate validation is DISABLED "
+            "(ENVIRONMENT=development AND MONGODB_ALLOW_INSECURE_TLS=true — "
+            "never enabled in staging/production)"
+        )
+
     _client = AsyncIOMotorClient(
         settings.MONGODB_URL,
 
-        # TLS / SSL Fix for macOS + MongoDB Atlas
+        # TLS / SSL — cert validation bypass is dev-only, see above
         tls=True,
         tlsCAFile=certifi.where(),
-        tlsAllowInvalidCertificates=True,
+        tlsAllowInvalidCertificates=allow_invalid_certs,
 
         # Connection Settings
         retryWrites=True,

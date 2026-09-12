@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # ── MongoDB Atlas ────────────────────────────────────────────────────
     MONGODB_URL: str = "mongodb+srv://<user>:<pass>@cluster0.mongodb.net/zoovox?retryWrites=true&w=majority"
     MONGODB_DB_NAME: str = "zoovox"
+    # Disables MongoDB TLS certificate validation. Defaults to False (secure).
+    # Only takes effect when ENVIRONMENT == "development" — see db/mongodb.py.
+    # Never set true in staging/production.
+    MONGODB_ALLOW_INSECURE_TLS: bool = False
 
     # ── JWT ───────────────────────────────────────────────────────────────
     JWT_SECRET_KEY: str = secrets.token_urlsafe(64)

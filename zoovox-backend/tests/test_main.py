@@ -92,6 +92,43 @@ async def test_login_wrong_credentials(client):
     assert r.status_code == 401
 
 
+@pytest.mark.asyncio
+async def test_login_fails_closed_when_database_unavailable():
+    """Degraded mode must never fabricate a user or issue a token."""
+    from app.main import app
+
+    with patch("app.api.v1.endpoints.auth.get_database", AsyncMock(return_value=None)):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            r = await ac.post("/api/v1/auth/login", json={
+                "email": "anyone@example.com",
+                "password": "WhateverPass1",
+            })
+
+    assert r.status_code == 503
+    body = r.json()
+    assert "access_token" not in body
+    assert "refresh_token" not in body
+
+
+@pytest.mark.asyncio
+async def test_register_fails_closed_when_database_unavailable():
+    """Degraded mode must never fabricate a user or issue a token."""
+    from app.main import app
+
+    with patch("app.api.v1.endpoints.auth.get_database", AsyncMock(return_value=None)):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            r = await ac.post("/api/v1/auth/register", json={
+                "name": "Someone New",
+                "email": "new-degraded-mode@example.com",
+                "password": "ValidPass1",
+            })
+
+    assert r.status_code == 503
+    body = r.json()
+    assert "access_token" not in body
+    assert "refresh_token" not in body
+
+
 # ── Audio Analysis Tests ──────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -238,3 +275,126 @@ async def test_human_to_animal_translate():
     assert "recommended_actions" in result
     assert len(result["recommended_actions"]) > 0
     assert "scientific_basis" in result
+
+
+# ── MongoDB TLS Scoping Tests ─────────────────────────────────────────────────
+
+class _FakeMotorClient:
+    """Stands in for AsyncIOMotorClient so connect_to_mongo() can be exercised
+    without a real MongoDB server, while capturing the kwargs it was built with."""
+
+    def __init__(self, *args, **kwargs):
+        self.captured_kwargs = kwargs
+        self.admin = MagicMock()
+        self.admin.command = AsyncMock(return_value={"ok": 1.0})
+        self.closed = False
+
+    def __getitem__(self, _name):
+        db = MagicMock()
+        db.users.create_indexes = AsyncMock()
+        db.audio_sessions.create_indexes = AsyncMock()
+        db.translations.create_indexes = AsyncMock()
+        db.vet_services.create_indexes = AsyncMock()
+        return db
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_mongo_tls_bypass_allowed_only_when_dev_and_explicitly_permitted():
+    """Cert validation may only be disabled when BOTH ENVIRONMENT=='development'
+    AND MONGODB_ALLOW_INSECURE_TLS is explicitly True."""
+    import app.db.mongodb as mongodb_module
+    from app.core.config import settings
+
+    created_clients = []
+
+    def _record_client(*args, **kwargs):
+        client = _FakeMotorClient(*args, **kwargs)
+        created_clients.append(client)
+        return client
+
+    with patch("app.db.mongodb.AsyncIOMotorClient", side_effect=_record_client), \
+         patch.object(settings, "ENVIRONMENT", "development"), \
+         patch.object(settings, "MONGODB_ALLOW_INSECURE_TLS", True):
+        await mongodb_module.connect_to_mongo()
+
+    assert created_clients[0].captured_kwargs["tlsAllowInvalidCertificates"] is True
+    await mongodb_module.close_mongo_connection()
+
+
+@pytest.mark.asyncio
+async def test_mongo_tls_validation_enforced_when_not_explicitly_permitted():
+    """Even in development, cert validation stays ON unless MONGODB_ALLOW_INSECURE_TLS
+    is explicitly set True — being 'development' alone must not be enough."""
+    import app.db.mongodb as mongodb_module
+    from app.core.config import settings
+
+    created_clients = []
+
+    def _record_client(*args, **kwargs):
+        client = _FakeMotorClient(*args, **kwargs)
+        created_clients.append(client)
+        return client
+
+    with patch("app.db.mongodb.AsyncIOMotorClient", side_effect=_record_client), \
+         patch.object(settings, "ENVIRONMENT", "development"), \
+         patch.object(settings, "MONGODB_ALLOW_INSECURE_TLS", False):
+        await mongodb_module.connect_to_mongo()
+
+    assert created_clients[0].captured_kwargs["tlsAllowInvalidCertificates"] is False
+    await mongodb_module.close_mongo_connection()
+
+
+@pytest.mark.asyncio
+async def test_mongo_tls_validation_enforced_outside_development():
+    """Staging/production must never disable cert validation, even if the
+    insecure-TLS flag is (mis)configured True — ENVIRONMENT is authoritative."""
+    import app.db.mongodb as mongodb_module
+    from app.core.config import settings
+
+    for env in ("production", "staging", "anything-else"):
+        created_clients = []
+
+        def _record_client(*args, **kwargs):
+            client = _FakeMotorClient(*args, **kwargs)
+            created_clients.append(client)
+            return client
+
+        with patch("app.db.mongodb.AsyncIOMotorClient", side_effect=_record_client), \
+             patch.object(settings, "ENVIRONMENT", env), \
+             patch.object(settings, "MONGODB_ALLOW_INSECURE_TLS", True):
+            await mongodb_module.connect_to_mongo()
+
+        assert created_clients[0].captured_kwargs["tlsAllowInvalidCertificates"] is False, (
+            f"TLS certificate validation was disabled for ENVIRONMENT={env!r}"
+        )
+        await mongodb_module.close_mongo_connection()
+
+
+@pytest.mark.asyncio
+async def test_mongo_tls_secure_by_default_when_unconfigured():
+    """With no explicit overrides (Settings() class defaults), cert validation
+    must stay ON — ENVIRONMENT defaulting to 'development' must not, by itself,
+    disable certificate validation."""
+    import app.db.mongodb as mongodb_module
+    from app.core.config import Settings
+
+    default_settings = Settings(_env_file=None, MONGODB_URL="mongodb+srv://placeholder/", JWT_SECRET_KEY="x", SECRET_KEY="x")
+    assert default_settings.ENVIRONMENT == "development"  # documented default
+    assert default_settings.MONGODB_ALLOW_INSECURE_TLS is False  # secure default
+
+    created_clients = []
+
+    def _record_client(*args, **kwargs):
+        client = _FakeMotorClient(*args, **kwargs)
+        created_clients.append(client)
+        return client
+
+    with patch("app.db.mongodb.AsyncIOMotorClient", side_effect=_record_client), \
+         patch("app.db.mongodb.settings", default_settings):
+        await mongodb_module.connect_to_mongo()
+
+    assert created_clients[0].captured_kwargs["tlsAllowInvalidCertificates"] is False
+    await mongodb_module.close_mongo_connection()
