@@ -76,6 +76,11 @@ class AudioAnalysisResponse(BaseModel):
     translation_en: str
     translation_local: Optional[str] = None
     raw_yamnet_scores: dict
+    prediction_source: str = Field(
+        "heuristic",
+        description="Which model produced the primary animal-type prediction: "
+        "'zoovox_classifier', 'yamnet', or 'heuristic'.",
+    )
     audio_duration_sec: float
     mel_spectrogram_url: Optional[str] = None
     reverse_cue_url: Optional[str] = None    # TTS audio for animal feedback

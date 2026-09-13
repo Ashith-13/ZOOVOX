@@ -56,6 +56,7 @@ import asyncio
 import hashlib
 import io
 import logging
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -63,6 +64,10 @@ from typing import Optional
 import numpy as np
 import librosa
 import soundfile as sf
+
+from app.core.config import settings
+from app.ml.model_interface import AnimalClassifierModel
+from app.ml.zoovox_classifier import SklearnZooVoxClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +140,23 @@ YAMNET_ANIMAL_CLASS_IDS = {
     "dolphin": [73, 74],
 }
 
+# Bump these manually if the corresponding branch's logic changes — used as
+# cache-invalidation metadata by the translations cache (see
+# AudioAnalysisService.current_pipeline_version()), never surfaced to clients.
+YAMNET_VERSION = "1"
+HEURISTIC_VERSION = "1"
+
+
+def compute_audio_hash(audio_bytes: bytes) -> str:
+    """
+    Fast fingerprint of an audio upload — SHA-256 over the first 4KB,
+    truncated to 16 hex chars. Used both as the audio_sessions record
+    fingerprint and as the translations-cache key. Single definition so the
+    two call sites can never drift out of sync.
+    """
+    return hashlib.sha256(audio_bytes[:4096]).hexdigest()[:16]
+
+
 # Behavioral context templates — based on ethological literature
 BEHAVIORAL_CONTEXTS = {
     ("dog", "happy"):     "Tail wagging, open mouth, relaxed posture. Classic greeting behavior described by Bradshaw & Rooney (2016) in Applied Animal Behaviour Science.",
@@ -158,7 +180,7 @@ class AudioAnalysisService:
 
     def __init__(self):
         self._yamnet_model = None
-        self._zoovox_classifier = None
+        self._zoovox_classifier: Optional[AnimalClassifierModel] = None
         self._model_loaded = False
 
     async def load_models(self):
@@ -174,17 +196,59 @@ class AudioAnalysisService:
         except Exception as e:
             logger.warning(f"TF Hub not available, using feature-extraction fallback: {e}")
 
-        try:
-            import joblib
-            from pathlib import Path
-            clf_path = Path("models/zoovox_classifier.pkl")
-            if clf_path.exists():
-                self._zoovox_classifier = joblib.load(clf_path)
-                logger.info("ZOOVOX custom classifier loaded ✅")
-        except Exception as e:
-            logger.warning(f"Custom classifier not found, using rule-based: {e}")
+        self._zoovox_classifier = self._load_zoovox_classifier()
 
         self._model_loaded = True
+
+    def current_pipeline_version(self) -> str:
+        """
+        Cheap, synchronous marker for "what the currently loaded models would
+        produce" — cache-layer metadata only, never returned to clients. Used
+        to invalidate translations-cache entries when the deployed model
+        changes (e.g. a new classifier artifact is loaded), without needing
+        to re-run analysis just to check. Reflects the model actually loaded
+        right now (via load_models()), not a hypothetical future state.
+        """
+        if self._zoovox_classifier is not None:
+            return f"zoovox_classifier:{self._zoovox_classifier.version}"
+        if self._yamnet_model is not None:
+            return f"yamnet:{YAMNET_VERSION}"
+        return f"heuristic:{HEURISTIC_VERSION}"
+
+    def _load_zoovox_classifier(self) -> Optional[AnimalClassifierModel]:
+        """Load the trained ZOOVOX classifier artifact via settings, if one
+        exists and is valid. Never raises — a missing or broken artifact is
+        always a safe degraded state, never a request-time failure.
+
+        Missing file: expected/normal (no model trained yet) — logged quietly.
+        Present but invalid/corrupt: an operator-actionable bug — logged loudly
+        with the real exception, so it isn't confused with "not trained yet".
+        """
+        clf_path = Path(settings.ZOOVOX_CLASSIFIER_PATH)
+
+        if not clf_path.exists():
+            logger.info(
+                f"No ZOOVOX classifier artifact at {clf_path} — "
+                "using YAMNet/heuristic fallback classification"
+            )
+            return None
+
+        try:
+            import joblib
+            artifact = joblib.load(clf_path)
+            classifier = SklearnZooVoxClassifier(artifact)
+            logger.info(
+                f"ZOOVOX custom classifier loaded ✅ "
+                f"(version={classifier.version}, classes={len(classifier.classes)})"
+            )
+            return classifier
+        except Exception as e:
+            logger.error(
+                f"ZOOVOX classifier artifact at {clf_path} exists but failed to load "
+                f"or is invalid — falling back: {e}",
+                exc_info=True,
+            )
+            return None
 
     async def analyze_audio(
         self,
@@ -219,7 +283,7 @@ class AudioAnalysisService:
         )
 
         # ── 6. Audio fingerprint for caching ─────────────────────────────
-        audio_hash = hashlib.sha256(audio_bytes[:4096]).hexdigest()[:16]
+        audio_hash = compute_audio_hash(audio_bytes)
 
         processing_ms = (time.time() - t0) * 1000
 
@@ -230,6 +294,7 @@ class AudioAnalysisService:
             "emotion_confidence": round(emotion_result["confidence"], 4),
             "translation_en": translation,
             "raw_yamnet_scores": animal_result.get("yamnet_top5", {}),
+            "prediction_source": animal_result.get("prediction_source", "heuristic"),
             "audio_duration_sec": round(duration, 2),
             "behavioral_context": behavioral_ctx,
             "research_reference": "YAMNet (Howard et al., 2019); AnimalSpeak (Ofer & Netzer, 2023); ESC-50 (Piczak, 2015)",
@@ -245,18 +310,37 @@ class AudioAnalysisService:
 
     def _decode_audio(self, audio_bytes: bytes, content_type: str) -> tuple:
         """Decode various audio formats → mono float32 @ 16kHz."""
-        buf = io.BytesIO(audio_bytes)
+        extension_map = {
+            "audio/webm": ".webm",
+            "audio/ogg": ".ogg",
+            "audio/wav": ".wav",
+            "audio/mp3": ".mp3",
+            "audio/mpeg": ".mp3",
+            "audio/mp4": ".m4a",
+            "audio/x-m4a": ".m4a",
+        }
+        suffix = extension_map.get(content_type.split(";", 1)[0].lower(), ".webm")
         try:
-            # librosa handles webm/ogg/mp3/wav via ffmpeg
-            waveform, sr = librosa.load(buf, sr=16000, mono=True, duration=30.0)
-        except Exception:
-            # Fallback: soundfile for WAV
-            buf.seek(0)
-            waveform, sr = sf.read(buf, dtype="float32")
-            if sr != 16000:
-                waveform = librosa.resample(waveform, orig_sr=sr, target_sr=16000)
-            if waveform.ndim > 1:
-                waveform = waveform.mean(axis=1)
+            # A real filename lets librosa/audioread select its FFmpeg backend
+            # for browser-recorded WebM and M4A. File-like objects only use
+            # SoundFile and therefore reject many MediaRecorder formats.
+            with tempfile.NamedTemporaryFile(suffix=suffix) as audio_file:
+                audio_file.write(audio_bytes)
+                audio_file.flush()
+                waveform, sr = librosa.load(audio_file.name, sr=16000, mono=True, duration=30.0)
+        except Exception as decode_error:
+            # Retain a direct WAV fallback for environments without FFmpeg.
+            try:
+                waveform, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+                if sr != 16000:
+                    waveform = librosa.resample(waveform, orig_sr=sr, target_sr=16000)
+                if waveform.ndim > 1:
+                    waveform = waveform.mean(axis=1)
+            except Exception as fallback_error:
+                raise ValueError(f"Unable to decode {content_type} audio") from fallback_error
+
+        if len(waveform) == 0:
+            raise ValueError("Audio contains no samples")
         return waveform, 16000
 
     def _extract_features(self, waveform: np.ndarray, sr: int) -> dict:
@@ -309,9 +393,35 @@ class AudioAnalysisService:
 
     def _classify_animal(self, features: dict, waveform: np.ndarray, sr: int) -> dict:
         """
-        Step 1: Try YAMNet if loaded.
-        Step 2: Fallback to spectral heuristics + random forest.
+        Precedence (approved design — not a confidence comparison between models):
+          1. PRIMARY   — the custom ZOOVOX classifier, when loaded and its
+                         prediction is valid. If it succeeds, its result is
+                         returned as-is; YAMNet is not consulted at all.
+          2. FALLBACK  — YAMNet, only reached when the custom classifier is
+                         unavailable (not loaded) or raises/fails to produce a
+                         valid prediction. YAMNet's confidence is never
+                         compared or blended with the custom classifier's —
+                         they are not calibrated against each other.
+          3. FALLBACK  — the spectral heuristic, when neither model produced
+                         a usable result.
+        Every branch tags its result with "prediction_source" so the caller
+        (and the API response) can identify which model produced it.
         """
+        if self._zoovox_classifier is not None:
+            try:
+                prediction = self._zoovox_classifier.predict(features["vector"])
+                return {
+                    "animal": prediction.animal,
+                    "confidence": prediction.confidence,
+                    "yamnet_top5": prediction.class_probabilities,
+                    "prediction_source": prediction.source,
+                    "model_version": prediction.model_version,
+                }
+            except Exception as e:
+                logger.warning(
+                    f"ZOOVOX classifier prediction failed, falling back to YAMNet/heuristic: {e}"
+                )
+
         if self._yamnet_model is not None:
             try:
                 import tensorflow as tf
@@ -330,12 +440,19 @@ class AudioAnalysisService:
                 # If YAMNet confidence > 0.4, trust it
                 if confidence > 0.4:
                     top5 = dict(sorted(animal_scores.items(), key=lambda x: x[1], reverse=True)[:5])
-                    return {"animal": best_animal, "confidence": confidence, "yamnet_top5": top5}
+                    return {
+                        "animal": best_animal,
+                        "confidence": confidence,
+                        "yamnet_top5": top5,
+                        "prediction_source": "yamnet",
+                    }
             except Exception as e:
                 logger.warning(f"YAMNet inference error: {e}")
 
         # ── Spectral heuristic fallback ───────────────────────────────────
-        return self._spectral_heuristic_classification(features)
+        result = self._spectral_heuristic_classification(features)
+        result["prediction_source"] = "heuristic"
+        return result
 
     def _spectral_heuristic_classification(self, features: dict) -> dict:
         """
@@ -377,7 +494,8 @@ class AudioAnalysisService:
         rms = float(features["rms"])
         zcr = float(features["zcr"])
         centroid = float(features["centroid"])
-        tempo = float(features.get("tempo", 0))
+        tempo_val = features.get("tempo", 0)
+        tempo = float(tempo_val[0]) if isinstance(tempo_val, (list, np.ndarray)) else float(tempo_val)
 
         # Energy-based arousal dimension
         high_energy = rms > 0.08
