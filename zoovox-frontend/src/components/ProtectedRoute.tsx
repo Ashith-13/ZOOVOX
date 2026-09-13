@@ -1,15 +1,16 @@
-import { Navigate } from "react-router-dom";
+import { Navigate, useLocation } from "react-router-dom";
+import { token } from "@/services/api";
 
 const ProtectedRoute = ({
   children,
 }: {
   children: JSX.Element;
 }) => {
+  const location = useLocation();
+  const accessToken = token.get();
 
-  const token = localStorage.getItem("token");
-
-  if (!token) {
-    return <Navigate to="/" replace />;
+  if (!accessToken) {
+    return <Navigate to="/" replace state={{ from: location.pathname }} />;
   }
 
   return children;
