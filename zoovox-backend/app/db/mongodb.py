@@ -61,12 +61,15 @@ async def connect_to_mongo():
 
     _db = _client[settings.MONGODB_DB_NAME]
 
-    # Test connection immediately
-    await _client.admin.command("ping")
-
-    await _ensure_indexes(_db)
-
-    logger.info(f"Connected to MongoDB: {settings.MONGODB_DB_NAME}")
+    # Test connection immediately — fail fast but don't block startup
+    try:
+        await _client.admin.command("ping")
+        await _ensure_indexes(_db)
+        logger.info(f"Connected to MongoDB: {settings.MONGODB_DB_NAME}")
+    except Exception as e:
+        logger.error(f"MongoDB connection failed: {e}")
+        logger.warning("Running with degraded mode — DB-dependent features unavailable")
+        _db = None
 
 
 async def close_mongo_connection():
@@ -77,12 +80,8 @@ async def close_mongo_connection():
         logger.info("MongoDB connection closed")
 
 
-async def get_database() -> AsyncIOMotorDatabase:
-    if _db is None:
-        raise RuntimeError(
-            "Database not initialised — call connect_to_mongo() first"
-        )
-
+async def get_database() -> AsyncIOMotorDatabase | None:
+    """Returns the DB handle, or None if MongoDB is unavailable (degraded mode)."""
     return _db
 
 
