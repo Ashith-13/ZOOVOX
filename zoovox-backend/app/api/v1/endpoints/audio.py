@@ -28,7 +28,9 @@ from app.schemas.schemas import (
     AudioAnalysisResponse, HumanToAnimalRequest, HumanToAnimalResponse,
     TranslationHistoryItem,
 )
-from app.services.audio_analysis import audio_analysis_service, compute_audio_hash
+from app.services.audio_analysis import (
+    AnimalClassificationUnavailable, audio_analysis_service, compute_audio_hash,
+)
 from app.services.human_to_animal import human_to_animal_service
 
 router = APIRouter(prefix="/audio", tags=["Audio Translation"])
@@ -162,6 +164,9 @@ async def analyze_audio(
             content_type=content_type,
             language=language,
         )
+    except AnimalClassificationUnavailable as e:
+        logger.warning(f"Animal classification unavailable: {e}")
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Audio analysis failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Audio analysis service error")

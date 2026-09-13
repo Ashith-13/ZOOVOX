@@ -169,6 +169,16 @@ BEHAVIORAL_CONTEXTS = {
 }
 
 
+class AnimalClassificationUnavailable(Exception):
+    """
+    Raised when neither the custom ZOOVOX classifier nor the YAMNet fallback
+    could produce a usable animal-type prediction. Never caught internally to
+    fabricate a guess — the caller (API layer) must surface this as an
+    honest "temporarily unavailable" response, never a confident-looking
+    result with an invented label/confidence.
+    """
+
+
 class AudioAnalysisService:
     """
     Production audio analysis pipeline.
@@ -402,10 +412,12 @@ class AudioAnalysisService:
                          valid prediction. YAMNet's confidence is never
                          compared or blended with the custom classifier's —
                          they are not calibrated against each other.
-          3. FALLBACK  — the spectral heuristic, when neither model produced
-                         a usable result.
-        Every branch tags its result with "prediction_source" so the caller
-        (and the API response) can identify which model produced it.
+        Every successful branch tags its result with "prediction_source" so
+        the caller (and the API response) can identify which model produced
+        it. If neither model produces a usable result, this raises
+        AnimalClassificationUnavailable rather than falling back to any
+        fabricated guess or hardcoded confidence — fail closed, never
+        invent a prediction. See ZOOVOX audit: heuristic fallback removal.
         """
         if self._zoovox_classifier is not None:
             try:
@@ -449,35 +461,14 @@ class AudioAnalysisService:
             except Exception as e:
                 logger.warning(f"YAMNet inference error: {e}")
 
-        # ── Spectral heuristic fallback ───────────────────────────────────
-        result = self._spectral_heuristic_classification(features)
-        result["prediction_source"] = "heuristic"
-        return result
-
-    def _spectral_heuristic_classification(self, features: dict) -> dict:
-        """
-        Rule-based classification using known spectral signatures of animal calls.
-        Derived from acoustic properties documented in Bioacoustics literature.
-
-        Dog barks:  fundamental freq 150–900 Hz, high ZCR, short burst
-        Cat meow:   fundamental freq 400–1200 Hz, harmonic rich, longer
-        Bird chirp: fundamental freq 2–8 kHz, rapid modulation
-        """
-        centroid = features["centroid"]
-        zcr = features["zcr"]
-        rms = features["rms"]
-
-        # Rough heuristic decision tree
-        if centroid > 4000 and zcr > 0.15:
-            return {"animal": "bird", "confidence": 0.68, "yamnet_top5": {"bird": 0.68}}
-        elif 1000 < centroid <= 3000 and rms > 0.01:
-            return {"animal": "cat", "confidence": 0.62, "yamnet_top5": {"cat": 0.62}}
-        elif centroid <= 1200 and zcr > 0.08:
-            return {"animal": "dog", "confidence": 0.65, "yamnet_top5": {"dog": 0.65}}
-        elif centroid <= 800:
-            return {"animal": "cow", "confidence": 0.55, "yamnet_top5": {"cow": 0.55}}
-        else:
-            return {"animal": "dog", "confidence": 0.45, "yamnet_top5": {"dog": 0.45}}
+        # Neither the custom classifier nor YAMNet produced a usable result.
+        # Fail closed: never fabricate a prediction, label, or confidence
+        # score. The caller must translate this into an honest "temporarily
+        # unavailable" response, never a confident-looking guess.
+        raise AnimalClassificationUnavailable(
+            "Animal classification is temporarily unavailable — no trained "
+            "model or fallback model produced a result for this audio."
+        )
 
     def _classify_emotion(self, features: dict, animal: str) -> dict:
         """
