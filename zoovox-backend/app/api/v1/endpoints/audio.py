@@ -8,7 +8,9 @@ Audio Translation Endpoints
   GET    /api/v1/audio/supported-animals — List supported species
 """
 
+import json
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -26,7 +28,7 @@ from app.schemas.schemas import (
     AudioAnalysisResponse, HumanToAnimalRequest, HumanToAnimalResponse,
     TranslationHistoryItem,
 )
-from app.services.audio_analysis import audio_analysis_service
+from app.services.audio_analysis import audio_analysis_service, compute_audio_hash
 from app.services.human_to_animal import human_to_animal_service
 
 router = APIRouter(prefix="/audio", tags=["Audio Translation"])
@@ -50,7 +52,72 @@ SUPPORTED_ANIMALS = [
 ]
 
 
-# ── Analyze Audio ─────────────────────────────────────────────────────────────
+# ── Analyze Audio (cache-first) ────────────────────────────────────────────────
+
+async def _get_or_compute_analysis(
+    db,
+    audio_bytes: bytes,
+    content_type: str,
+    language: str,
+) -> dict:
+    """
+    Cache-first wrapper around audio_analysis_service.analyze_audio(), shared
+    by the REST endpoint and the WebSocket "end" path so both get identical
+    caching behavior.
+
+    Cache key: the existing audio_hash (unique-indexed in db.translations).
+    Cache validity: the stored pipeline_version must match
+    audio_analysis_service.current_pipeline_version() — invalidates stale
+    results automatically when the deployed model changes, without any
+    manual cache-flush step.
+
+    Cache failures (read or write) never block or crash the primary
+    analysis — any error while touching the cache is logged and the request
+    proceeds as if the cache didn't exist. If db is None (MongoDB
+    unavailable), the cache is skipped entirely and behavior is identical to
+    before this feature existed.
+    """
+    t0 = time.time()
+    await audio_analysis_service.load_models()
+    audio_hash = compute_audio_hash(audio_bytes)
+    current_version = audio_analysis_service.current_pipeline_version()
+
+    if db is not None:
+        cached = None
+        try:
+            cached = await db.translations.find_one({"audio_hash": audio_hash})
+        except Exception as e:
+            logger.warning(f"Translation cache read failed, proceeding without cache: {e}")
+
+        if cached and cached.get("pipeline_version") == current_version:
+            logger.info(f"Translation cache hit (audio_hash={audio_hash})")
+            result = dict(cached["result"])
+            result["processing_time_ms"] = round((time.time() - t0) * 1000, 1)
+            return result
+
+    analysis = await audio_analysis_service.analyze_audio(
+        audio_bytes=audio_bytes,
+        content_type=content_type,
+        user_language=language,
+    )
+
+    if db is not None:
+        try:
+            await db.translations.update_one(
+                {"audio_hash": audio_hash},
+                {"$set": {
+                    "audio_hash": audio_hash,
+                    "pipeline_version": current_version,
+                    "result": analysis,
+                    "created_at": datetime.now(timezone.utc),
+                }},
+                upsert=True,
+            )
+        except Exception as e:
+            logger.warning(f"Translation cache write failed (non-fatal): {e}")
+
+    return analysis
+
 
 @router.post("/analyze", response_model=AudioAnalysisResponse)
 async def analyze_audio(
@@ -70,10 +137,11 @@ async def analyze_audio(
       6. Return full analysis response
     """
     # ── Validation ────────────────────────────────────────────────────────
-    if audio.content_type not in SUPPORTED_MIME:
+    content_type = (audio.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type not in SUPPORTED_MIME:
         raise HTTPException(
             status_code=415,
-            detail=f"Unsupported audio type: {audio.content_type}. Supported: {', '.join(SUPPORTED_MIME)}",
+            detail=f"Unsupported audio type: {audio.content_type or 'unknown'}. Supported: {', '.join(SUPPORTED_MIME)}",
         )
 
     audio_bytes = await audio.read()
@@ -85,12 +153,14 @@ async def analyze_audio(
     if len(audio_bytes) < 1024:
         raise HTTPException(status_code=400, detail="Audio file too short or empty")
 
-    # ── ML Analysis ───────────────────────────────────────────────────────
+    # ── ML Analysis (cache-first) ────────────────────────────────────────────
+    db = await get_database()
     try:
-        analysis = await audio_analysis_service.analyze_audio(
+        analysis = await _get_or_compute_analysis(
+            db=db,
             audio_bytes=audio_bytes,
-            content_type=audio.content_type,
-            user_language=language,
+            content_type=content_type,
+            language=language,
         )
     except Exception as e:
         logger.error(f"Audio analysis failed: {e}", exc_info=True)
@@ -98,7 +168,6 @@ async def analyze_audio(
 
     # ── Persist to MongoDB ────────────────────────────────────────────────
     session_id = str(uuid.uuid4())
-    db = await get_database()
     session_doc = {
         "session_id": session_id,
         "user_id": str(current_user["_id"]),
@@ -114,13 +183,15 @@ async def analyze_audio(
         "language": language,
         "created_at": datetime.now(timezone.utc),
     }
-    await db.audio_sessions.insert_one(session_doc)
+    if db is not None:
+        await db.audio_sessions.insert_one(session_doc)
 
     # Increment user stats
-    await db.users.update_one(
-        {"_id": current_user["_id"]},
-        {"$inc": {"animals_analyzed": 1}},
-    )
+    if db is not None:
+        await db.users.update_one(
+            {"_id": current_user["_id"]},
+            {"$inc": {"animals_analyzed": 1}},
+        )
 
     return AudioAnalysisResponse(
         session_id=session_id,
@@ -183,6 +254,12 @@ async def get_history(
 ):
     """Paginated translation history for the current user."""
     db = await get_database()
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Translation history is temporarily unavailable. Please try again shortly.",
+        )
+
     query = {"user_id": str(current_user["_id"])}
     if animal:
         query["animal_type"] = animal
@@ -220,6 +297,12 @@ async def get_session(
     current_user: dict = Depends(get_current_active_user),
 ):
     db = await get_database()
+    if db is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Session history is temporarily unavailable. Please try again shortly.",
+        )
+
     session = await db.audio_sessions.find_one({
         "session_id": session_id,
         "user_id": str(current_user["_id"]),
@@ -243,21 +326,19 @@ async def supported_animals():
 @router.websocket("/stream")
 async def audio_stream_ws(websocket: WebSocket):
     """
-    Real-time audio streaming analysis via WebSocket.
+    Authenticated real-time recording stream.
 
-    Protocol (client → server):
-      { "type": "auth", "token": "<JWT>" }
-      { "type": "audio_chunk", "data": "<base64 PCM chunk>", "animal_hint": "dog" }
-      { "type": "end" }
-
-    Protocol (server → client):
-      { "type": "interim", "animal_type": "...", "confidence": 0.7 }
-      { "type": "final", ...full AudioAnalysisResponse... }
-      { "type": "error", "message": "..." }
+    The browser sends `auth` first, then MediaRecorder blobs as binary frames,
+    followed by `end`. JSON/base64 `audio_chunk` messages are supported for
+    backwards compatibility. The final response is persisted exactly like
+    POST /audio/analyze and includes its `session_id`.
     """
     await websocket.accept()
     user = None
-    audio_buffer = b""
+    audio_buffer = bytearray()
+    content_type = "audio/webm"
+    language = "en"
+    last_interim_size = 0
 
     try:
         import base64
@@ -265,15 +346,51 @@ async def audio_stream_ws(websocket: WebSocket):
         from bson import ObjectId
 
         while True:
-            msg = await websocket.receive_json()
+            frame = await websocket.receive()
+            if frame.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(code=status.WS_1000_NORMAL_CLOSURE)
+
+            # React sends MediaRecorder slices as binary WebSocket frames. A
+            # JSON/base64 payload remains available for non-browser clients.
+            if frame.get("bytes") is not None:
+                msg = {"type": "audio_chunk"}
+                chunk_bytes = frame["bytes"]
+            else:
+                try:
+                    msg = json.loads(frame.get("text") or "{}")
+                except json.JSONDecodeError:
+                    await websocket.send_json({"type": "error", "message": "Invalid WebSocket message"})
+                    continue
+                chunk_bytes = None
+
             msg_type = msg.get("type")
 
             if msg_type == "auth":
                 try:
                     payload = decode_token(msg["token"])
+                    if payload.get("type") != "access":
+                        raise ValueError("Access token required")
                     db = await get_database()
+                    if db is None:
+                        # Fail closed: never authenticate against a
+                        # fabricated user. This is a distinct, honest
+                        # outcome from "invalid token" — the database is
+                        # unavailable, so identity cannot be verified at all.
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": "Live audio authentication is temporarily unavailable. Please try again shortly.",
+                        })
+                        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+                        return
                     user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
                     if user:
+                        requested_type = (msg.get("content_type") or "audio/webm").split(";", 1)[0].strip().lower()
+                        if requested_type not in SUPPORTED_MIME:
+                            await websocket.send_json({"type": "error", "message": "Unsupported audio format"})
+                            await websocket.close(code=status.WS_1003_UNSUPPORTED_DATA)
+                            return
+                        content_type = requested_type
+                        language = str(msg.get("language") or "en")[:10]
                         await websocket.send_json({"type": "auth_ok", "user": user["name"]})
                     else:
                         await websocket.send_json({"type": "error", "message": "Invalid user"})
@@ -288,16 +405,32 @@ async def audio_stream_ws(websocket: WebSocket):
                 if not user:
                     await websocket.send_json({"type": "error", "message": "Not authenticated"})
                     continue
-                chunk_b64 = msg.get("data", "")
-                chunk_bytes = base64.b64decode(chunk_b64)
-                audio_buffer += chunk_bytes
+                if chunk_bytes is None:
+                    try:
+                        chunk_bytes = base64.b64decode(msg.get("data", ""), validate=True)
+                    except (ValueError, TypeError):
+                        await websocket.send_json({"type": "error", "message": "Invalid base64 audio chunk"})
+                        continue
 
-                # Send interim analysis every ~1 second of audio
-                if len(audio_buffer) > 32000:  # ~2s at 16kHz mono int16
+                if not chunk_bytes:
+                    continue
+                if len(audio_buffer) + len(chunk_bytes) > MAX_AUDIO_BYTES:
+                    await websocket.send_json({"type": "error", "message": f"Audio exceeds {settings.AUDIO_MAX_FILE_MB} MB limit"})
+                    await websocket.close(code=status.WS_1009_MESSAGE_TOO_BIG)
+                    return
+
+                audio_buffer.extend(chunk_bytes)
+
+                # MediaRecorder chunks are compressed containers, not raw
+                # 16-bit PCM. Analyze the complete recording so the decoder
+                # receives a valid WebM/OGG stream.
+                if len(audio_buffer) - last_interim_size >= 24 * 1024:
+                    last_interim_size = len(audio_buffer)
                     try:
                         interim = await audio_analysis_service.analyze_audio(
-                            audio_bytes=audio_buffer[-32000:],
-                            content_type="audio/wav",
+                            audio_bytes=bytes(audio_buffer),
+                            content_type=content_type,
+                            user_language=language,
                         )
                         await websocket.send_json({
                             "type": "interim",
@@ -311,17 +444,48 @@ async def audio_stream_ws(websocket: WebSocket):
             elif msg_type == "end":
                 if not user or not audio_buffer:
                     await websocket.send_json({"type": "error", "message": "No audio received"})
-                    break
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
 
                 try:
-                    final = await audio_analysis_service.analyze_audio(
-                        audio_bytes=audio_buffer,
-                        content_type="audio/wav",
+                    db = await get_database()
+                    final = await _get_or_compute_analysis(
+                        db=db,
+                        audio_bytes=bytes(audio_buffer),
+                        content_type=content_type,
+                        language=language,
                     )
-                    await websocket.send_json({"type": "final", **final})
+                    session_id = str(uuid.uuid4())
+                    if db is not None:
+                        await db.audio_sessions.insert_one({
+                            "session_id": session_id,
+                            "user_id": str(user["_id"]),
+                            "direction": "animal_to_human",
+                            "animal_type": final["animal_type"],
+                            "detected_emotion": final["detected_emotion"],
+                            "animal_confidence": final["animal_confidence"],
+                            "emotion_confidence": final["emotion_confidence"],
+                            "translation_en": final["translation_en"],
+                            "audio_duration_sec": final["audio_duration_sec"],
+                            "processing_time_ms": final["processing_time_ms"],
+                            "audio_hash": final["audio_hash"],
+                            "language": language,
+                            "created_at": datetime.now(timezone.utc),
+                        })
+                        await db.users.update_one(
+                            {"_id": user["_id"]},
+                            {"$inc": {"animals_analyzed": 1}},
+                        )
+
+                    await websocket.send_json({
+                        "type": "final",
+                        "session_id": session_id,
+                        **{key: value for key, value in final.items() if key not in {"audio_hash", "features_snapshot"}},
+                    })
                 except Exception as e:
                     await websocket.send_json({"type": "error", "message": str(e)})
-                break
+                await websocket.close()
+                return
 
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")
