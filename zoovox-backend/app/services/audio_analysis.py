@@ -71,58 +71,63 @@ from app.ml.zoovox_classifier import SklearnZooVoxClassifier
 
 logger = logging.getLogger(__name__)
 
-# ── Animal taxonomy & translation map ────────────────────────────────────────
-# Based on ethological research & AnimalSpeak paper (Ofer & Netzer, 2023)
-ANIMAL_EMOTION_TRANSLATIONS = {
+# ── Animal taxonomy & behavioral-context reference ───────────────────────────
+# IMPORTANT — scientific scope: these are curated, third-person reference
+# descriptions of vocalization categories informed by ethological literature
+# (incl. the AnimalSpeak framework, Ofer & Netzer 2023). They are NOT a
+# literal decoding of this specific animal's audio, thoughts, or words —
+# nothing in this codebase performs literal animal-to-human language
+# translation. See ZOOVOX audit: scientific reframing (translation removal).
+ANIMAL_VOCALIZATION_CONTEXT = {
     "dog": {
-        "happy":     "I'm happy and excited to see you! Let's play!",
-        "fearful":   "I'm scared and need reassurance. Please comfort me.",
-        "aggressive":"Stay away! I feel threatened and am warning you.",
-        "hungry":    "I'm very hungry and need food right now.",
-        "playful":   "Come play with me! I have so much energy!",
-        "lonely":    "I miss you and feel lonely. Please pay attention to me.",
-        "pain":      "I'm in pain and need immediate help.",
-        "alert":     "I detected something unusual — be cautious!",
+        "happy":     "Vocalization pattern often associated with an excited, friendly greeting state.",
+        "fearful":   "Vocalization pattern often associated with fear or a need for reassurance.",
+        "aggressive":"Vocalization pattern often associated with a defensive or territorial warning.",
+        "hungry":    "Vocalization pattern often associated with food-solicitation behavior.",
+        "playful":   "Vocalization pattern often associated with high-energy play invitation.",
+        "lonely":    "Vocalization pattern often associated with social isolation distress.",
+        "pain":      "Vocalization pattern often associated with a pain or distress response — consider a veterinary check.",
+        "alert":     "Vocalization pattern often associated with an alert response to something unusual.",
     },
     "cat": {
-        "happy":     "I'm content and comfortable in this space.",
-        "fearful":   "I feel threatened. Please give me space to calm down.",
-        "aggressive":"Do not touch me. I am irritated and will defend myself.",
-        "hungry":    "Feed me now. My meal is overdue.",
-        "playful":   "I'm in hunting mode. Engage me with toys!",
-        "lonely":    "I seek companionship. Sit with me.",
-        "pain":      "Something hurts. I need a vet check.",
-        "alert":     "I sense an intruder or unusual presence nearby.",
+        "happy":     "Vocalization pattern often associated with a relaxed, content state.",
+        "fearful":   "Vocalization pattern often associated with a defensive fear response.",
+        "aggressive":"Vocalization pattern often associated with irritation or a defensive threat display.",
+        "hungry":    "Vocalization pattern often associated with a food-solicitation call.",
+        "playful":   "Vocalization pattern often associated with hunting/play-drive behavior.",
+        "lonely":    "Vocalization pattern often associated with a desire for companionship.",
+        "pain":      "Vocalization pattern often associated with discomfort — consider a veterinary check.",
+        "alert":     "Vocalization pattern often associated with detecting an unfamiliar presence.",
     },
     "bird": {
-        "happy":     "I'm in high spirits and the environment feels safe.",
-        "fearful":   "Predator detected! Danger is near!",
-        "aggressive":"This is my territory. You are not welcome here.",
-        "hungry":    "I need food. My energy reserves are low.",
-        "playful":   "I want to sing and explore. Provide enrichment!",
-        "lonely":    "I need a flock. Isolation is stressful for me.",
-        "pain":      "I'm not well. Check my feathers and breathing.",
-        "alert":     "Environmental change detected. Monitor conditions.",
+        "happy":     "Vocalization pattern often associated with a calm, secure state.",
+        "fearful":   "Vocalization pattern often associated with a predator-alarm response.",
+        "aggressive":"Vocalization pattern often associated with territorial defense.",
+        "hungry":    "Vocalization pattern often associated with a food-solicitation call.",
+        "playful":   "Vocalization pattern often associated with exploratory, enrichment-seeking behavior.",
+        "lonely":    "Vocalization pattern often associated with flock-contact seeking.",
+        "pain":      "Vocalization pattern often associated with distress — consider checking overall condition.",
+        "alert":     "Vocalization pattern often associated with a response to environmental change.",
     },
     "horse": {
-        "happy":     "I'm calm and at ease with my surroundings.",
-        "fearful":   "Something startled me. Give me space and speak softly.",
-        "aggressive":"Back away. I feel cornered and will react.",
-        "hungry":    "My feeding schedule is overdue.",
-        "playful":   "I want to run and explore. Let me out!",
-        "lonely":    "I'm a herd animal. Isolation causes me distress.",
-        "pain":      "I'm experiencing discomfort — check my hooves and legs.",
-        "alert":     "I smell or hear something unfamiliar. Stay calm.",
+        "happy":     "Vocalization pattern often associated with a calm, at-ease state.",
+        "fearful":   "Vocalization pattern often associated with a startle or fear response.",
+        "aggressive":"Vocalization pattern often associated with feeling cornered or defensive.",
+        "hungry":    "Vocalization pattern often associated with feeding-schedule anticipation.",
+        "playful":   "Vocalization pattern often associated with high-energy, exploratory behavior.",
+        "lonely":    "Vocalization pattern often associated with herd-separation distress.",
+        "pain":      "Vocalization pattern often associated with discomfort — consider a veterinary check.",
+        "alert":     "Vocalization pattern often associated with detecting something unfamiliar.",
     },
     "cow": {
-        "happy":     "I'm comfortable with good nutrition and social bonds.",
-        "fearful":   "The environment is stressful. Reduce noise and crowding.",
-        "aggressive":"I feel threatened. Provide space and reduce stimulation.",
-        "hungry":    "My grazing needs are not being met.",
-        "playful":   "Young cattle are playful — provide open space.",
-        "lonely":    "Social separation is causing stress.",
-        "pain":      "I may have lameness or mastitis. Veterinary check needed.",
-        "alert":     "Something unusual in my environment. I'm on guard.",
+        "happy":     "Vocalization pattern often associated with a comfortable, well-nourished state.",
+        "fearful":   "Vocalization pattern often associated with a stress response to the environment.",
+        "aggressive":"Vocalization pattern often associated with feeling threatened or crowded.",
+        "hungry":    "Vocalization pattern often associated with unmet grazing/feeding needs.",
+        "playful":   "Vocalization pattern often associated with playful behavior (common in young cattle).",
+        "lonely":    "Vocalization pattern often associated with social separation stress.",
+        "pain":      "Vocalization pattern often associated with discomfort — consider a veterinary check (e.g. lameness, mastitis).",
+        "alert":     "Vocalization pattern often associated with heightened vigilance.",
     },
 }
 
@@ -267,7 +272,9 @@ class AudioAnalysisService:
         user_language: str = "en",
     ) -> dict:
         """
-        Full pipeline: bytes → features → classification → translation → response
+        Full pipeline: bytes → features → classification → behavioral-context
+        reference lookup → response. No stage performs literal animal-to-human
+        language translation — see ANIMAL_VOCALIZATION_CONTEXT's module comment.
         """
         t0 = time.time()
         await self.load_models()
@@ -285,8 +292,8 @@ class AudioAnalysisService:
         # ── 4. Emotion detection ──────────────────────────────────────────
         emotion_result = await asyncio.to_thread(self._classify_emotion, features, animal_result["animal"])
 
-        # ── 5. Translation lookup ─────────────────────────────────────────
-        translation = self._get_translation(animal_result["animal"], emotion_result["emotion"])
+        # ── 5. Behavioral-context reference lookup (not a translation) ────
+        context_text = self._get_behavioral_context(animal_result["animal"], emotion_result["emotion"])
         behavioral_ctx = BEHAVIORAL_CONTEXTS.get(
             (animal_result["animal"], emotion_result["emotion"]),
             "Vocalization pattern analyzed using YAMNet AudioSet features (Howard et al., 2019)."
@@ -302,7 +309,7 @@ class AudioAnalysisService:
             "animal_confidence": round(animal_result["confidence"], 4),
             "detected_emotion": emotion_result["emotion"],
             "emotion_confidence": round(emotion_result["confidence"], 4),
-            "translation_en": translation,
+            "translation_en": context_text,
             "raw_yamnet_scores": animal_result.get("yamnet_top5", {}),
             "prediction_source": animal_result.get("prediction_source", "heuristic"),
             "audio_duration_sec": round(duration, 2),
@@ -509,8 +516,11 @@ class AudioAnalysisService:
         else:
             return {"emotion": "playful", "confidence": 0.61}
 
-    def _get_translation(self, animal: str, emotion: str) -> str:
-        animal_map = ANIMAL_EMOTION_TRANSLATIONS.get(animal)
+    def _get_behavioral_context(self, animal: str, emotion: str) -> str:
+        """Returns curated reference text for the classified (animal, emotion)
+        pair — never a literal decoding of this specific audio. See
+        ANIMAL_VOCALIZATION_CONTEXT's module comment for the scientific scope."""
+        animal_map = ANIMAL_VOCALIZATION_CONTEXT.get(animal)
         if animal_map:
             return animal_map.get(emotion, f"[{animal.title()}] Unrecognized vocalization pattern — behavioral context needed.")
         return "Animal sound detected. Species not in current model scope."

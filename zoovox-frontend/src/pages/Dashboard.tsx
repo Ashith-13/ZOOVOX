@@ -173,7 +173,7 @@ const Dashboard = () => {
             setIsRecordingAnimal(false);
             setIsFinalizingAnimal(false);
             audioStreamRef.current = null;
-            toast.success(`Translation: “${result.translation_en}”`);
+            toast.success(`Reference context: ${result.translation_en}`);
           },
           onError: (message) => {
             if (!mountedRef.current) return;
@@ -380,19 +380,20 @@ const Dashboard = () => {
           {analysisResult && (
             <Card className="w-full max-w-md mt-6 p-4 animate-fade-in">
               <div className="flex items-center justify-between mb-2">
-                <h3 className="font-semibold">Translation result</h3>
+                <h3 className="font-semibold">Behavioral Interpretation</h3>
                 <Button
                   variant="ghost"
                   size="icon"
                   onClick={() => setAnalysisResult(null)}
                   className="text-muted-foreground"
-                  aria-label="Dismiss translation result"
+                  aria-label="Dismiss interpretation result"
                 >
                   <X className="w-4 h-4" />
                 </Button>
               </div>
               <div className="space-y-2 text-sm">
-                <p className="font-medium">“{analysisResult.translation_en}”</p>
+                <p className="text-xs text-muted-foreground uppercase tracking-wide">Reference Context</p>
+                <p className="font-medium">{analysisResult.translation_en}</p>
                 <div className="flex flex-wrap items-center gap-4 text-muted-foreground">
                   <span className="flex items-center gap-1 capitalize">
                     <PawPrint className="w-3 h-3" />
@@ -415,9 +416,12 @@ const Dashboard = () => {
                     </span>
                   </span>
                 </div>
+                <p className="text-xs text-muted-foreground uppercase tracking-wide mt-1">General Reference</p>
                 <p className="text-xs text-muted-foreground">{analysisResult.behavioral_context}</p>
                 <p className="text-xs text-muted-foreground/80 italic">
-                  Confidence reflects the model's certainty in its own prediction — not a guarantee the interpretation is correct.
+                  Confidence reflects the model's certainty in its own prediction, not a
+                  guarantee it's correct. Reference context is general information, not a
+                  literal translation or direct decoding of this animal's communication.
                 </p>
 
                 <div className="pt-2 mt-1 border-t border-border/40 text-xs text-muted-foreground/80">

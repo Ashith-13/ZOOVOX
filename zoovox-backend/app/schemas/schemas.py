@@ -73,7 +73,14 @@ class AudioAnalysisResponse(BaseModel):
     animal_confidence: float = Field(..., ge=0.0, le=1.0)
     detected_emotion: str
     emotion_confidence: float = Field(..., ge=0.0, le=1.0)
-    translation_en: str
+    translation_en: str = Field(
+        ...,
+        description=(
+            "Curated behavioral/contextual reference text for the classified "
+            "vocalization — NOT a literal translation or decoding of this "
+            "specific animal's audio, thoughts, or words."
+        ),
+    )
     translation_local: Optional[str] = None
     raw_yamnet_scores: dict
     prediction_source: str = Field(
@@ -84,7 +91,14 @@ class AudioAnalysisResponse(BaseModel):
     audio_duration_sec: float
     mel_spectrogram_url: Optional[str] = None
     reverse_cue_url: Optional[str] = None    # TTS audio for animal feedback
-    behavioral_context: str
+    behavioral_context: str = Field(
+        ...,
+        description=(
+            "General reference information about typical behavior associated "
+            "with the classified category — not derived from this specific "
+            "recording."
+        ),
+    )
     research_reference: str
     processing_time_ms: float
 
@@ -108,7 +122,10 @@ class TranslationHistoryItem(BaseModel):
     session_id: str
     direction: Literal["animal_to_human", "human_to_animal"]
     animal_type: str
-    translation: str
+    translation: str = Field(
+        ...,
+        description="Curated behavioral/contextual reference text — not a literal translation.",
+    )
     confidence: float
     created_at: datetime
 

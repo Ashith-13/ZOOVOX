@@ -295,16 +295,34 @@ def test_feature_extraction_produces_correct_shape():
 
 
 def test_emotion_classification_returns_valid_emotion():
-    from app.services.audio_analysis import audio_analysis_service, ANIMAL_EMOTION_TRANSLATIONS
+    from app.services.audio_analysis import audio_analysis_service, ANIMAL_VOCALIZATION_CONTEXT
     import numpy as np
 
     y = np.random.randn(16000 * 3).astype(np.float32)
     features = audio_analysis_service._extract_features(y, 16000)
     result = audio_analysis_service._classify_emotion(features, "dog")
 
-    valid_emotions = list(ANIMAL_EMOTION_TRANSLATIONS["dog"].keys())
+    valid_emotions = list(ANIMAL_VOCALIZATION_CONTEXT["dog"].keys())
     assert result["emotion"] in valid_emotions
     assert 0.0 <= result["confidence"] <= 1.0
+
+
+def test_vocalization_context_does_not_claim_literal_translation():
+    """Scientific-honesty regression test: no behavioral-context reference
+    string may use first-person phrasing that implies the audio was
+    literally decoded into the animal's own words/thoughts."""
+    from app.services.audio_analysis import ANIMAL_VOCALIZATION_CONTEXT
+
+    first_person_markers = ("i'm ", "i am ", "i feel", "i need", "i want", "i sense", "i detected", "my ", "me now", "feed me")
+
+    for animal, emotions in ANIMAL_VOCALIZATION_CONTEXT.items():
+        for emotion, text in emotions.items():
+            lowered = text.lower()
+            for marker in first_person_markers:
+                assert marker not in lowered, (
+                    f"ANIMAL_VOCALIZATION_CONTEXT[{animal!r}][{emotion!r}] still contains "
+                    f"first-person phrasing ({marker!r}): {text!r}"
+                )
 
 
 def test_spectral_heuristic_classification():

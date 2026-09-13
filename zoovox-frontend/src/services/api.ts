@@ -90,8 +90,14 @@ export interface AudioAnalysisResult {
   animal_confidence: number;
   detected_emotion: string;
   emotion_confidence: number;
+  // Curated behavioral/contextual reference text for the classified
+  // vocalization — NOT a literal translation or decoding of this animal's
+  // audio, thoughts, or words. Display as reference context, never as a
+  // quoted "what the animal said."
   translation_en: string;
   audio_duration_sec: number;
+  // General reference info about the classified category — not derived
+  // from this specific recording.
   behavioral_context: string;
   research_reference: string;
   processing_time_ms: number;
@@ -151,6 +157,7 @@ export interface HistoryItem {
   session_id: string;
   direction: "animal_to_human" | "human_to_animal";
   animal_type: string;
+  // Curated behavioral/contextual reference text — not a literal translation.
   translation: string;
   confidence: number;
   created_at: string;

@@ -68,7 +68,7 @@
 | **YAMNet** | Howard et al., "Large-Scale Audio Classification" | 2019 | Primary feature extractor + 521-class detector |
 | **VGGish** | Hershey et al., "CNN Architectures for Audio Classification" | 2017 | 128-dim audio embeddings |
 | **ESC-50** | Piczak, "ESC: Dataset for Environmental Sound Classification" | 2015 | Training + validation benchmark |
-| **AnimalSpeak** | Ofer & Netzer, "Animal Communication Semantics" | 2023 | Emotional state mapping framework |
+| **AnimalSpeak** | Ofer & Netzer, "Animal Communication Semantics" | 2023 | Behavioral-context reference material (not a translation system) |
 | **BirdNET** | Kahl et al., "BirdNET: A deep learning solution" | 2021 | Bird species sub-classifier |
 
 ### Face Recognition
@@ -83,10 +83,10 @@
 
 | Reference | Topic | Used For |
 |-----------|-------|----------|
-| Bradshaw & Rooney (2016) — *Applied Animal Behaviour Science* | Dog social behavior | Dog emotion translations |
-| Briefer & McElligott (2011) — *Animal Behaviour* | Goat vocalizations | General mammal emotion mapping |
+| Bradshaw & Rooney (2016) — *Applied Animal Behaviour Science* | Dog social behavior | Dog behavioral-context reference |
+| Briefer & McElligott (2011) — *Animal Behaviour* | Goat vocalizations | General mammal behavioral-context reference |
 | Marler (1955) — *Behaviour* | Bird alarm calls | Bird alert cue synthesis |
-| Turner & Bateson (2000) — *The Domestic Cat* | Cat social signals | Cat translation corpus |
+| Turner & Bateson (2000) — *The Domestic Cat* | Cat social signals | Cat behavioral-context reference |
 | Fitch & Hauser (2002) — *Evolution and Human Behaviour* | Vertebrate vocalizations | H→A synthesis frequency mapping |
 | Manteuffel et al. (2004) — *Animal Welfare* | Pig distress calls | Farm animal monitoring |
 
@@ -257,21 +257,29 @@ Audio Input (WebM/WAV/MP3)
         ▼
  ZOOVOX Custom MLP Classifier
    Input(104) → Dense(256, ReLU) → Dense(128, ReLU)
-   → Branch 1: Animal type (10 classes)
-   → Branch 2: Emotion (8 classes)
+   → Animal/vocalization-source classification (10 classes)
+   (Emotion detection below is a separate, rule-based heuristic — not a
+   trained model branch of this classifier.)
         │
         ▼
- Translation Lookup
- (AnimalSpeak framework + ethology literature)
+ Behavioral-Context Reference Lookup
+ (curated reference text informed by ethology literature — not a
+ translation of this animal's audio into human language)
         │
         ▼
  [Optional] Coqui TTS → species-specific reverse cue audio
 ```
 
-**Model Performance (ESC-50 animal subset, 5-fold CV):**
-- Animal classification: **87.4%** (±2.1%)
-- Human baseline ESC-50: 81.3%
-- Random Forest baseline: 74.2%
+**Model Performance (real result from the currently trained artifact,
+`models/zoovox_classifier.pkl`; see `models/zoovox_classifier.metrics.json`
+for the full per-class breakdown and confusion matrix):**
+- Evaluation setup: single group-aware train/test split (320 train / 80
+  test samples), grouped by ESC-50 fold to prevent same-recording leakage
+  — **not** k-fold cross-validation.
+- Held-out test accuracy: **73.75%**
+- Macro precision / recall / F1: **78.0% / 73.75% / 73.3%**
+- Small test set (80 samples, 8 per class) — treat as an early baseline
+  result, not a production-quality benchmark.
 
 ---
 
