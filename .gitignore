@@ -24,3 +24,7 @@ build/
 
 # Logs
 *.log
+
+# Trained ML model artifacts — regenerable binary output, no LFS configured
+# in this repository; never commit trained model files.
+models/
