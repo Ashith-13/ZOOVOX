@@ -26,7 +26,11 @@ from app.schemas.schemas import (
     FaceLoginRequest, FaceEnrollRequest,
     TokenResponse, RefreshRequest, UserPublicProfile,
 )
-from app.services.face_recognition import face_recognition_service
+from app.services.face_recognition import (
+    face_recognition_service,
+    EmbeddingEncryptionUnavailable,
+    EmbeddingDecryptionError,
+)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 logger = logging.getLogger(__name__)
@@ -140,7 +144,20 @@ async def enroll_face(
     Store face embedding for authenticated user.
     Accepts a single base64 frame; production clients should send 3+ frames
     for better accuracy (averaged by the service).
+
+    Liveness is checked as a data-quality signal (reject an obviously
+    spoofed enrollment frame) but, unlike face/login, enrollment does not
+    fail closed when the anti-spoofing model is merely unavailable — the
+    caller already holds a valid JWT to reach this endpoint, so this isn't
+    an authentication-bypass surface the way face/login is.
     """
+    liveness = face_recognition_service.check_liveness(payload.frame_b64)
+    if liveness["status"] == "spoof_detected":
+        raise HTTPException(
+            status_code=422,
+            detail="This looks like a photo or screen, not a live camera. Please try again using your camera directly.",
+        )
+
     embedding = face_recognition_service.enroll([payload.frame_b64])
     if embedding is None:
         raise HTTPException(
@@ -148,10 +165,23 @@ async def enroll_face(
             detail="No face detected in the provided frame. Ensure good lighting and face visibility.",
         )
 
+    # Fail closed: never store a new embedding in plaintext. If encryption
+    # isn't configured, enrollment is unavailable rather than degrading.
+    try:
+        encrypted_embedding = face_recognition_service.encrypt_embedding(embedding)
+    except EmbeddingEncryptionUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="Face enrollment is temporarily unavailable. Please try again later.",
+        )
+
     db = await get_database()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Face enrollment unavailable in demo mode (requires DB)")
+
     await db.users.update_one(
         {"_id": current_user["_id"]},
-        {"$set": {"face_embedding": embedding, "face_enrolled_at": datetime.now(timezone.utc)}},
+        {"$set": {"face_embedding": encrypted_embedding, "face_enrolled_at": datetime.now(timezone.utc)}},
     )
     return {"success": True, "message": "Face enrolled successfully"}
 
@@ -161,15 +191,41 @@ async def enroll_face(
 @router.post("/face/login", response_model=TokenResponse)
 async def face_login(payload: FaceLoginRequest):
     """
-    Step 1: extract embedding from frame
+    Face login is convenience-tier authentication, not a full security
+    boundary — password login remains the authoritative path and is
+    unaffected by anything below.
+
+    Step 0: liveness/anti-spoofing check — deliberately separate from and
+            gating identity verification. Fails closed (503) if the
+            anti-spoofing model itself is unavailable; identity verification
+            never runs on a frame that hasn't passed this check.
+    Step 1: extract embedding from frame (identity only, no liveness signal)
     Step 2: scan all enrolled users (production: use ANN index like FAISS)
     Step 3: return best match if distance < threshold
     """
     db = await get_database()
 
+    liveness = face_recognition_service.check_liveness(payload.frame_b64)
+    if liveness["status"] == "unavailable":
+        raise HTTPException(
+            status_code=503,
+            detail="Face login is temporarily unavailable. Please sign in with your password.",
+        )
+    if liveness["status"] == "no_face_detected":
+        raise HTTPException(status_code=422, detail="No face detected in frame")
+    if liveness["status"] == "spoof_detected":
+        raise HTTPException(
+            status_code=401,
+            detail="Face login failed. Please use a live camera and try again, or sign in with your password.",
+        )
+    # liveness["status"] == "live" — proceed to identity verification.
+
     live_emb = face_recognition_service.extract_embedding(payload.frame_b64)
     if live_emb is None:
         raise HTTPException(status_code=422, detail="No face detected in frame")
+
+    if db is None:
+        raise HTTPException(status_code=503, detail="Face login unavailable in demo mode (requires DB)")
 
     # Load all enrolled users (production: replace with FAISS ANN search)
     enrolled_users = await db.users.find(
@@ -178,14 +234,31 @@ async def face_login(payload: FaceLoginRequest):
 
     best_user = None
     best_result = {"distance": 1.0, "verified": False}
+    encryption_unavailable_encountered = False
 
     for user in enrolled_users:
-        result = face_recognition_service.verify(payload.frame_b64, user["face_embedding"])
+        try:
+            stored_embedding = face_recognition_service.decrypt_embedding(user["face_embedding"])
+        except EmbeddingEncryptionUnavailable:
+            # Key missing/invalid — this record genuinely can't be checked,
+            # distinct from "checked and it didn't match".
+            encryption_unavailable_encountered = True
+            continue
+        except EmbeddingDecryptionError:
+            logger.warning(f"Skipping unreadable face embedding for user {user['_id']}")
+            continue
+
+        result = face_recognition_service.verify(payload.frame_b64, stored_embedding)
         if result["verified"] and result["distance"] < best_result["distance"]:
             best_user = user
             best_result = result
 
     if not best_user:
+        if encryption_unavailable_encountered:
+            raise HTTPException(
+                status_code=503,
+                detail="Face login is temporarily unavailable. Please sign in with your password.",
+            )
         raise HTTPException(
             status_code=401,
             detail="Face not recognized. Please use email/password login.",

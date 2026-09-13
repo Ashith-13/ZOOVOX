@@ -49,6 +49,18 @@ class Settings(BaseSettings):
     ZOOVOX_CLASSIFIER_PATH: str = "models/zoovox_classifier.pkl"
     FACE_EMBEDDINGS_DIM: int = 128            # DeepFace embedding dimension
 
+    # ── Face Embedding Encryption ────────────────────────────────────────
+    # Fernet key (urlsafe-base64, 32 bytes) protecting stored face
+    # embeddings at rest. Deliberately NOT auto-generated like SECRET_KEY/
+    # JWT_SECRET_KEY above — an auto-generated key would silently change on
+    # every process restart, permanently losing the ability to decrypt any
+    # previously-encrypted embedding. Must be explicitly set; unset means
+    # encryption is unavailable (new enrollments fail closed rather than
+    # falling back to plaintext).
+    # Generate with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    FACE_EMBEDDING_ENCRYPTION_KEY: Optional[str] = None
+
     # ── Audio ────────────────────────────────────────────────────────────
     AUDIO_SAMPLE_RATE: int = 16000
     AUDIO_MAX_DURATION_SECONDS: int = 30
