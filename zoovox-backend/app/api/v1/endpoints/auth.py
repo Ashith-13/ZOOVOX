@@ -208,6 +208,14 @@ async def refresh_token(payload: RefreshRequest):
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     db = await get_database()
+    if db is None:
+        # Fail closed: never fabricate a user or issue a token when the
+        # database is unreachable. Credentials/identity cannot be verified
+        # without it.
+        raise HTTPException(
+            status_code=503,
+            detail="Token refresh is temporarily unavailable. Please try again shortly.",
+        )
     user = await db.users.find_one({"_id": ObjectId(decoded["sub"])})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")

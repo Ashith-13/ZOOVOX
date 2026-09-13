@@ -129,6 +129,133 @@ async def test_register_fails_closed_when_database_unavailable():
     assert "refresh_token" not in body
 
 
+# ── Refresh / Current-User Fail-Closed Tests ─────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_refresh_fails_closed_when_database_unavailable():
+    """Degraded mode must never fabricate a user or issue a token on refresh."""
+    from app.main import app
+    from app.core.security import create_refresh_token
+    from bson import ObjectId
+
+    refresh_token_value = create_refresh_token(str(ObjectId()), "anyone@example.com")
+
+    with patch("app.api.v1.endpoints.auth.get_database", AsyncMock(return_value=None)):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            r = await ac.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token_value})
+
+    assert r.status_code == 503
+    body = r.json()
+    assert "access_token" not in body
+    assert "refresh_token" not in body
+
+
+@pytest.mark.asyncio
+async def test_refresh_succeeds_with_valid_token_and_available_database():
+    """Normal refresh behavior must be unaffected by the fail-closed fix."""
+    from app.main import app
+    from app.core.security import create_refresh_token
+    from bson import ObjectId
+    from datetime import datetime, timezone
+
+    user_id = ObjectId()
+    user_doc = {
+        "_id": user_id, "email": "refresh-ok@example.com", "name": "Refresh Tester",
+        "plan": "free", "animals_analyzed": 0, "created_at": datetime.now(timezone.utc),
+        "face_embedding": None,
+    }
+    mock_db = MagicMock()
+    mock_db.users.find_one = AsyncMock(return_value=user_doc)
+
+    refresh_token_value = create_refresh_token(str(user_id), user_doc["email"])
+
+    with patch("app.api.v1.endpoints.auth.get_database", AsyncMock(return_value=mock_db)):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            r = await ac.post("/api/v1/auth/refresh", json={"refresh_token": refresh_token_value})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["access_token"]
+    assert body["refresh_token"]
+    assert body["user"]["email"] == "refresh-ok@example.com"
+
+
+@pytest.mark.asyncio
+async def test_refresh_rejects_invalid_token_regardless_of_database():
+    """An invalid/garbage refresh token must still be rejected before any
+    database check — unaffected by the fail-closed fix."""
+    from app.main import app
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r = await ac.post("/api/v1/auth/refresh", json={"refresh_token": "not-a-real-jwt"})
+
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_get_current_user_fails_closed_when_database_unavailable():
+    """The shared auth dependency (used by every protected endpoint) must
+    never return a fabricated user when the database is unreachable."""
+    from app.main import app
+    from app.core.security import create_access_token
+    from bson import ObjectId
+
+    access_token = create_access_token({"sub": str(ObjectId()), "email": "anyone@example.com"})
+
+    with patch("app.core.security.get_database", AsyncMock(return_value=None)):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            r = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {access_token}"})
+
+    assert r.status_code == 503
+    assert "Demo User" not in r.text
+    body = r.json()
+    assert "name" not in body
+
+
+@pytest.mark.asyncio
+async def test_get_current_user_succeeds_when_database_available():
+    """Normal authenticated-request behavior must be unaffected by the
+    fail-closed fix."""
+    from app.main import app
+    from app.core.security import create_access_token
+    from bson import ObjectId
+    from datetime import datetime, timezone
+
+    user_id = ObjectId()
+    user_doc = {
+        "_id": user_id, "email": "me-ok@example.com", "name": "Me Tester",
+        "plan": "free", "animals_analyzed": 0, "created_at": datetime.now(timezone.utc),
+        "face_embedding": None, "is_active": True, "is_banned": False,
+    }
+    mock_db = MagicMock()
+    mock_db.users.find_one = AsyncMock(return_value=user_doc)
+
+    access_token = create_access_token({"sub": str(user_id), "email": user_doc["email"]})
+
+    with patch("app.core.security.get_database", AsyncMock(return_value=mock_db)):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+            r = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {access_token}"})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["email"] == "me-ok@example.com"
+    assert body["name"] == "Me Tester"
+
+
+@pytest.mark.asyncio
+async def test_get_current_user_rejects_missing_and_invalid_tokens():
+    """The fail-closed fix must not weaken existing auth rejection behavior
+    for requests that were never going to be authenticated anyway."""
+    from app.main import app
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        r_missing = await ac.get("/api/v1/auth/me")
+        assert r_missing.status_code in (401, 403)
+
+        r_invalid = await ac.get("/api/v1/auth/me", headers={"Authorization": "Bearer not-a-real-jwt"})
+        assert r_invalid.status_code == 401
+
+
 # ── Audio Analysis Tests ──────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

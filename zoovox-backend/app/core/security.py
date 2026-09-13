@@ -64,6 +64,14 @@ async def get_current_user(
 
     db = await get_database()
     from bson import ObjectId
+    if db is None:
+        # Fail closed: identity, ban status, and account existence cannot be
+        # verified without the database — never authenticate against a
+        # fabricated user.
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is temporarily unavailable. Please try again shortly.",
+        )
     user = await db.users.find_one({"_id": ObjectId(user_id)})
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
