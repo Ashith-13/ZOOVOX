@@ -342,18 +342,52 @@ def test_spectral_heuristic_classification():
 
 
 # ── Face Recognition Tests ────────────────────────────────────────────────────
+#
+# These mock at the DeepFace call boundary rather than depending on a real
+# face being detected in a fixture image. No real photo of a real person is
+# available to this test suite, and a procedurally-generated synthetic face
+# was empirically confirmed NOT to pass real detection (both RetinaFace and
+# OpenCV Haar reject it) — so these tests instead verify our own service
+# logic (extraction, normalization, comparison, liveness gating) given a
+# realistic DeepFace return shape. They do not verify RetinaFace/Fasnet's own
+# detection accuracy — that's DeepFace's own test suite's concern.
 
-def test_face_recognition_simulation_mode():
-    """In simulation mode (deepface not installed), embeddings should still be generated."""
-    from app.services.face_recognition import face_recognition_service
+_SAMPLE_FRAME_B64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AJQAB/9k="
 
-    import base64
-    # 1x1 white JPEG
-    white_pixel_b64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AJQAB/9k="
 
-    emb = face_recognition_service.extract_embedding(white_pixel_b64)
-    assert emb is not None
-    assert len(emb) == 128
+def _fake_arcface_embedding(seed: float = 1.0) -> list:
+    """A realistic-shaped (but fake) 128-dim ArcFace embedding, deterministic per seed."""
+    rng = np.random.RandomState(int(seed * 1000) % (2**31))
+    vec = rng.randn(128).astype(np.float32)
+    return (vec / np.linalg.norm(vec)).tolist()
+
+
+def test_face_recognition_fails_closed_when_deepface_unavailable():
+    """When DeepFace is unavailable, extract_embedding() must raise
+    FaceRecognitionUnavailable — never fabricate a pseudo-embedding from the
+    raw image bytes. Regression test for a removed hash-based 'simulation
+    mode' fallback that could silently produce a non-biometric vector and
+    have it treated as a real face embedding downstream."""
+    from app.services.face_recognition import FaceRecognitionService, FaceRecognitionUnavailable
+
+    service = FaceRecognitionService()
+    with patch.object(service, "_ensure_deepface", return_value=False):
+        with pytest.raises(FaceRecognitionUnavailable):
+            service.extract_embedding(_SAMPLE_FRAME_B64)
+
+
+def test_face_verify_fails_closed_when_deepface_unavailable():
+    """verify() must never complete a comparison using a fabricated
+    embedding when DeepFace is unavailable — it must propagate the
+    fail-closed exception instead of returning any verified/not-verified
+    result computed from placeholder data."""
+    from app.services.face_recognition import FaceRecognitionService, FaceRecognitionUnavailable
+
+    service = FaceRecognitionService()
+    stored = _fake_arcface_embedding(seed=99.0)
+    with patch.object(service, "_ensure_deepface", return_value=False):
+        with pytest.raises(FaceRecognitionUnavailable):
+            service.verify(_SAMPLE_FRAME_B64, stored)
 
 
 def test_face_verify_same_embedding():
@@ -369,6 +403,172 @@ def test_face_verify_same_embedding():
     # Same embedding → should verify (distance ≈ 0)
     assert result["verified"] is True
     assert result["distance"] < 0.05
+
+
+def test_compare_embeddings_matches_verify_for_same_embedding():
+    """compare_embeddings() on an already-extracted embedding must agree
+    with verify()'s own extract-then-compare result — it's the same math,
+    just without re-running face detection/ArcFace inference."""
+    from app.services.face_recognition import FaceRecognitionService
+
+    service = FaceRecognitionService()
+    fake_embedding = _fake_arcface_embedding(seed=21.0)
+
+    with patch.object(service, "_ensure_deepface", return_value=True), \
+         patch("deepface.DeepFace.represent", return_value=[{"embedding": fake_embedding}]):
+        live_emb = service.extract_embedding(_SAMPLE_FRAME_B64)
+
+    result = service.compare_embeddings(live_emb, live_emb.tolist())
+
+    assert result["verified"] is True
+    assert result["distance"] < 0.05
+
+
+def test_compare_embeddings_mismatched_rejected():
+    """compare_embeddings() must reject two genuinely different embeddings,
+    same as verify() does — never a fabricated match."""
+    from app.services.face_recognition import FaceRecognitionService
+
+    service = FaceRecognitionService()
+    enrolled_embedding = _fake_arcface_embedding(seed=22.0)
+    live_embedding = np.array(_fake_arcface_embedding(seed=23.0), dtype=np.float32)
+
+    result = FaceRecognitionService().compare_embeddings(live_embedding, enrolled_embedding)
+
+    assert result["verified"] is False
+    assert result["reason"] == "distance_exceeds_threshold"
+
+
+def _fresh_fernet_key() -> str:
+    from cryptography.fernet import Fernet
+    return Fernet.generate_key().decode()
+
+
+@pytest.mark.asyncio
+async def test_face_enroll_endpoint_fails_closed_when_deepface_unavailable():
+    """When the real face-recognition model (DeepFace) cannot be loaded,
+    POST /auth/face/enroll must fail closed (503) and must never store a
+    fabricated embedding. Regression test for the removed hash-based
+    'simulation mode' fallback. Exercises the real check_liveness() ->
+    enroll() -> extract_embedding() chain — only _ensure_deepface() is
+    patched, everything else runs for real."""
+    from app.main import app
+    from app.core.security import create_access_token
+    from app.services.face_recognition import face_recognition_service
+    from bson import ObjectId
+
+    user_id = ObjectId()
+    mock_db = MagicMock()
+    mock_db.users.update_one = AsyncMock()
+    mock_db.users.find_one = AsyncMock(return_value={
+        "_id": user_id, "email": "enroll-nodeepface@example.com",
+        "is_active": True, "is_banned": False, "name": "Enroll Tester",
+    })
+    access_token = create_access_token({"sub": str(user_id), "email": "enroll-nodeepface@example.com"})
+
+    face_recognition_service._anti_spoofing_available = None
+    try:
+        with patch.object(face_recognition_service, "_ensure_deepface", return_value=False), \
+             patch("app.api.v1.endpoints.auth.get_database", AsyncMock(return_value=mock_db)), \
+             patch("app.core.security.get_database", AsyncMock(return_value=mock_db)):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                r = await ac.post(
+                    "/api/v1/auth/face/enroll",
+                    json={"frame_b64": _SAMPLE_FRAME_B64, "user_id": ""},
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+    finally:
+        face_recognition_service._anti_spoofing_available = None
+
+    assert r.status_code == 503
+    mock_db.users.update_one.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_face_login_extracts_live_embedding_exactly_once_regardless_of_enrolled_user_count():
+    """Regression test for the N+1 redundant-inference latency bug:
+    extract_embedding() (face detection + ArcFace inference — the expensive
+    step) must run exactly once per face-login request no matter how many
+    enrolled users are scanned. Comparisons against each stored embedding
+    must go through compare_embeddings() on the already-extracted live
+    embedding, never re-extract the same live frame per user."""
+    from app.main import app
+    from app.core.config import settings
+    from app.services.face_recognition import face_recognition_service
+    from bson import ObjectId
+
+    face_recognition_service._encryption_available = None
+    key = _fresh_fernet_key()
+    live_embedding = np.array(_fake_arcface_embedding(seed=31.0), dtype=np.float32)
+
+    # Three enrolled users, none matching the live embedding — the point of
+    # this test is the extract_embedding() call count, not a successful
+    # match; a non-matching setup still exercises the full comparison loop.
+    with patch.object(settings, "FACE_EMBEDDING_ENCRYPTION_KEY", key):
+        encrypted_embeddings = [
+            face_recognition_service.encrypt_embedding(_fake_arcface_embedding(seed=s))
+            for s in (32.0, 33.0, 34.0)
+        ]
+    face_recognition_service._encryption_available = None
+
+    enrolled_users = [
+        {"_id": ObjectId(), "email": f"user{i}@example.com", "name": f"User {i}",
+         "face_embedding": enc, "is_banned": False}
+        for i, enc in enumerate(encrypted_embeddings)
+    ]
+    mock_db = MagicMock()
+    mock_db.users.find = MagicMock(return_value=MagicMock(to_list=AsyncMock(return_value=enrolled_users)))
+
+    extract_spy = MagicMock(return_value=live_embedding)
+
+    try:
+        with patch.object(settings, "FACE_EMBEDDING_ENCRYPTION_KEY", key), \
+             patch("app.api.v1.endpoints.auth.get_database", AsyncMock(return_value=mock_db)), \
+             patch.object(face_recognition_service, "check_liveness", return_value={"status": "live", "score": 0.9}), \
+             patch.object(face_recognition_service, "extract_embedding", extract_spy):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+                r = await ac.post("/api/v1/auth/face/login", json={"frame_b64": _SAMPLE_FRAME_B64})
+    finally:
+        face_recognition_service._encryption_available = None
+
+    assert r.status_code == 401  # none of the 3 stored embeddings match — expected
+    assert extract_spy.call_count == 1
+
+
+def test_liveness_check_does_not_pass_unsupported_max_faces_kwarg():
+    """Compatibility guard: DeepFace.extract_faces() in the installed
+    deepface==0.0.100 does NOT accept a max_faces argument (confirmed via
+    inspect.signature — it raises 'unexpected keyword argument max_faces'
+    if passed). check_liveness() must never pass it. If DeepFace is
+    upgraded to a version that does support it, re-verify the signature
+    before reintroducing this — do not guess."""
+    from app.services.face_recognition import FaceRecognitionService
+
+    service = FaceRecognitionService()
+    mock_extract_faces = MagicMock(return_value=[{"is_real": True, "antispoof_score": 0.9}])
+    with patch.object(service, "_ensure_deepface", return_value=True), \
+         patch("deepface.modules.modeling.build_model", return_value=MagicMock()), \
+         patch("deepface.DeepFace.extract_faces", mock_extract_faces):
+        service.check_liveness(_SAMPLE_FRAME_B64)
+
+    assert "max_faces" not in mock_extract_faces.call_args.kwargs
+
+
+def test_extract_embedding_requests_deterministic_single_face_selection():
+    """extract_embedding() must ask DeepFace.represent() for max_faces=1 —
+    confirmed supported by the installed deepface==0.0.100 via
+    inspect.signature — so a multi-face frame deterministically resolves to
+    the largest face rather than detector-order luck."""
+    from app.services.face_recognition import FaceRecognitionService
+
+    service = FaceRecognitionService()
+    fake_embedding = _fake_arcface_embedding(seed=41.0)
+    mock_represent = MagicMock(return_value=[{"embedding": fake_embedding}])
+    with patch.object(service, "_ensure_deepface", return_value=True), \
+         patch("deepface.DeepFace.represent", mock_represent):
+        service.extract_embedding(_SAMPLE_FRAME_B64)
+
+    assert mock_represent.call_args.kwargs["max_faces"] == 1
 
 
 # ── Veterinary Tests ──────────────────────────────────────────────────────────

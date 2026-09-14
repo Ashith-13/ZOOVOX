@@ -209,8 +209,10 @@ async def face_login(payload: FaceLoginRequest):
             gating identity verification. Fails closed (503) if the
             anti-spoofing model itself is unavailable; identity verification
             never runs on a frame that hasn't passed this check.
-    Step 1: extract embedding from frame (identity only, no liveness signal)
-    Step 2: scan all enrolled users (production: use ANN index like FAISS)
+    Step 1: extract embedding from frame ONCE (identity only, no liveness
+            signal) — never re-extracted per enrolled user below.
+    Step 2: scan all enrolled users, comparing the same live embedding via
+            compare_embeddings() (production: use ANN index like FAISS)
     Step 3: return best match if distance < threshold
     """
     db = await get_database()
@@ -258,7 +260,10 @@ async def face_login(payload: FaceLoginRequest):
             logger.warning(f"Skipping unreadable face embedding for user {user['_id']}")
             continue
 
-        result = face_recognition_service.verify(payload.frame_b64, stored_embedding)
+        # Compare the already-extracted live embedding (computed once,
+        # above) against each stored embedding — never re-run face
+        # detection/ArcFace inference per enrolled user.
+        result = face_recognition_service.compare_embeddings(live_emb, stored_embedding)
         if result["verified"] and result["distance"] < best_result["distance"]:
             best_user = user
             best_result = result

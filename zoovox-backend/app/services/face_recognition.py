@@ -258,6 +258,11 @@ class FaceRecognitionService:
             nparr = np.frombuffer(img_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
+            # NOTE: DeepFace.extract_faces() in the installed deepface==0.0.100
+            # does NOT accept a max_faces argument (confirmed via
+            # inspect.signature — it's only on DeepFace.represent() in this
+            # version, used below in extract_embedding()). Do not add it here
+            # without re-verifying the installed signature first.
             faces = DeepFace.extract_faces(
                 img_path=img,
                 detector_backend="retinaface",
@@ -305,6 +310,16 @@ class FaceRecognitionService:
                 detector_backend="retinaface",   # best accuracy per DeepFace benchmarks
                 enforce_detection=True,
                 align=True,
+                max_faces=1,  # deterministic selection: when multiple faces
+                              # are present, DeepFace.represent() (supported
+                              # in the installed deepface==0.0.100 — verified
+                              # via inspect.signature) keeps the largest.
+                              # check_liveness()'s DeepFace.extract_faces()
+                              # has no equivalent option in this version, so
+                              # the two calls are not guaranteed to select the
+                              # same face on a multi-face frame — a known,
+                              # currently-unresolved limitation, not silently
+                              # papered over here.
             )
             embedding = np.array(result[0]["embedding"], dtype=np.float32)
             # L2-normalize for cosine similarity
@@ -339,18 +354,34 @@ class FaceRecognitionService:
 
     def verify(self, frame_b64: str, stored_embedding: list) -> dict:
         """
-        Compare live frame embedding against stored enrollment embedding.
+        Compare a live frame against a single stored enrollment embedding.
         Uses cosine distance (ArcFace optimal metric — Deng et al., 2019).
+
+        Convenience wrapper around extract_embedding() + compare_embeddings().
+        Checking one live frame against MANY stored embeddings (e.g. face
+        login scanning all enrolled users) should call extract_embedding()
+        once and then compare_embeddings() per stored embedding instead —
+        calling verify() in a loop re-runs face detection/ArcFace inference
+        on the identical frame once per iteration, which is both wasteful
+        and, on CPU, the dominant source of face-login latency.
         """
         live_emb = self.extract_embedding(frame_b64)
         if live_emb is None:
             return {"verified": False, "reason": "no_face_detected", "distance": None}
+        return self.compare_embeddings(live_emb, stored_embedding)
 
+    def compare_embeddings(self, live_embedding: np.ndarray, stored_embedding: list) -> dict:
+        """
+        Pure comparison between an already-extracted live embedding and a
+        stored enrollment embedding. Performs no face detection or model
+        inference — safe and cheap to call once per stored embedding when
+        checking one live frame against many enrolled users.
+        """
         stored = np.array(stored_embedding, dtype=np.float32)
         stored = stored / (np.linalg.norm(stored) + 1e-9)
 
         # Cosine distance = 1 - cosine_similarity
-        cosine_sim = float(np.dot(live_emb, stored))
+        cosine_sim = float(np.dot(live_embedding, stored))
         cosine_dist = 1.0 - cosine_sim
 
         verified = cosine_dist < COSINE_THRESHOLD
