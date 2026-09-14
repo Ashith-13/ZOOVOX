@@ -53,7 +53,6 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 COSINE_THRESHOLD = 0.40   # ArcFace recommended threshold
-EMBEDDING_DIM = 128
 
 # Literal, inspectable format/version tag checked before any decryption is
 # attempted — an unrecognized stored value is rejected as such rather than
@@ -71,6 +70,13 @@ class EmbeddingDecryptionError(Exception):
     """Decryption was attempted but failed — wrong key, corrupted/tampered
     ciphertext, or an unrecognized stored format. Never includes the key,
     ciphertext, or any recovered plaintext in its message."""
+
+
+class FaceRecognitionUnavailable(Exception):
+    """The real face-recognition model (DeepFace/ArcFace) cannot be loaded —
+    embedding extraction cannot be attempted at all. Callers must treat this
+    as fail-closed and must never substitute a fabricated/synthetic
+    embedding, the same way EmbeddingEncryptionUnavailable is handled."""
 
 
 class FaceRecognitionService:
@@ -93,7 +99,7 @@ class FaceRecognitionService:
             self._deepface_available = True
             logger.info("DeepFace (ArcFace) loaded ✅")
         except ImportError:
-            logger.warning("deepface not installed — face auth in simulation mode")
+            logger.warning("deepface not installed — face recognition unavailable (fails closed)")
             self._deepface_available = False
         self._checked = True
         return self._deepface_available
@@ -274,14 +280,17 @@ class FaceRecognitionService:
         Decode base64 JPEG, detect face, return 128-dim ArcFace embedding.
         Returns None if no face detected. Pure identity extraction — carries
         no information about liveness; see check_liveness() for that.
+
+        Raises FaceRecognitionUnavailable if the real embedding model
+        (DeepFace/ArcFace) cannot be loaded at all. Never falls back to a
+        fabricated/synthetic embedding — callers must treat this the same
+        way they treat EmbeddingEncryptionUnavailable: fail closed, never
+        proceed with a placeholder identity vector.
         """
         if not self._ensure_deepface():
-            # Simulation mode — return deterministic pseudo-embedding from image hash
-            import hashlib
-            h = hashlib.sha256(frame_b64[:200].encode()).digest()
-            vec = np.frombuffer(h * (EMBEDDING_DIM // 32 + 1), dtype=np.uint8)[:EMBEDDING_DIM].astype(np.float32)
-            vec = vec / np.linalg.norm(vec)
-            return vec
+            raise FaceRecognitionUnavailable(
+                "Face recognition model is not available."
+            )
 
         try:
             from deepface import DeepFace

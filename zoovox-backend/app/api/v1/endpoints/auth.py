@@ -30,6 +30,7 @@ from app.services.face_recognition import (
     face_recognition_service,
     EmbeddingEncryptionUnavailable,
     EmbeddingDecryptionError,
+    FaceRecognitionUnavailable,
 )
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -158,7 +159,16 @@ async def enroll_face(
             detail="This looks like a photo or screen, not a live camera. Please try again using your camera directly.",
         )
 
-    embedding = face_recognition_service.enroll([payload.frame_b64])
+    # Fail closed: never fabricate an embedding when the real face
+    # recognition model is unavailable — enrollment must be rejected, not
+    # silently stored against a non-biometric placeholder.
+    try:
+        embedding = face_recognition_service.enroll([payload.frame_b64])
+    except FaceRecognitionUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="Face enrollment is temporarily unavailable. Please try again later.",
+        )
     if embedding is None:
         raise HTTPException(
             status_code=422,
